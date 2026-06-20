@@ -104,6 +104,201 @@ Not bad for ~3 minutes on a CPU, for a hint of the right character gestalt. If y
 
 Finally, on Apple Silicon Macbooks and with a recent PyTorch version make sure to add `--device=mps` (short for "Metal Performance Shaders"); PyTorch then uses the on-chip GPU that can *significantly* accelerate training (2-3X) and allow you to use larger networks. See [Issue 28](https://github.com/karpathy/nanoGPT/issues/28) for more.
 
+## How to conduct experiment
+
+This section collects practical launch commands for single-GPU, multi-GPU (DDP), and multi-node training. nanoGPT uses **Distributed Data Parallel (DDP)** for multi-GPU runs. It does **not** implement model parallelism or pipeline parallelism (not needed for GPT-2 124M-scale models).
+
+### 0. Prepare data (once)
+
+Character-level Shakespeare (quick smoke test):
+
+```sh
+python data/shakespeare_char/prepare.py
+```
+
+OpenWebText (GPT-2 reproduction):
+
+```sh
+python data/openwebtext/prepare.py
+```
+
+### 1. Single GPU
+
+**NVIDIA GPU (default — `device=auto` picks CUDA):**
+
+```sh
+python train.py config/train_shakespeare_char.py --compile=False
+```
+
+**Apple Silicon Mac (MPS):**
+
+```sh
+python train.py config/train_shakespeare_char.py --device=mps --compile=False
+```
+
+`sample.py` defaults to `device=auto` and will pick MPS on Mac automatically:
+
+```sh
+python sample.py --out_dir=out-shakespeare-char
+```
+
+**NVIDIA H20 / A100 — recommended stable flags**
+
+On some H20 stacks, `bfloat16` + Flash Attention backward can crash with `Floating point exception (core dumped)`. Use:
+
+```sh
+python train.py config/train_shakespeare_char.py \
+  --compile=False \
+  --dtype=float32 \
+  --disable_flash=True
+```
+
+### 2. Multi-GPU — single node (e.g. 8× H20)
+
+Use `torchrun`. Each GPU runs one process; gradients are synchronized via DDP.
+
+```sh
+torchrun --standalone --nproc_per_node=8 train.py config/train_shakespeare_char.py \
+  --gradient_accumulation_steps=8 \
+  --compile=False \
+  --dtype=float32 \
+  --disable_flash=True
+```
+
+**Important:** `gradient_accumulation_steps` must be **divisible by the number of GPUs**. The config default `gradient_accumulation_steps=1` will fail on 8 GPUs with an `AssertionError`.
+
+GPT-2 124M on 8 GPUs (OpenWebText):
+
+```sh
+torchrun --standalone --nproc_per_node=8 train.py config/train_gpt2.py \
+  --compile=False \
+  --dtype=float32 \
+  --disable_flash=True
+```
+
+Default `config/train_gpt2.py` uses `gradient_accumulation_steps=40`, which is divisible by 8.
+
+**Fair comparison on a tiny dataset:** 8 GPUs process `8×` tokens per iteration. To match the total token count of a single-GPU run with the same `max_iters`, divide `max_iters` by 8:
+
+```sh
+torchrun --standalone --nproc_per_node=8 train.py config/train_shakespeare_char.py \
+  --gradient_accumulation_steps=8 \
+  --max_iters=625 \
+  --compile=False \
+  --dtype=float32 \
+  --disable_flash=True
+```
+
+### 3. Multi-GPU — multi-node (e.g. 4 nodes × 8 GPUs = 32 GPUs)
+
+Run **one command per node** at roughly the same time. Only `--node_rank` changes. Replace `10.0.0.1` with the master node's IP.
+
+```sh
+# Node 0 (master)
+torchrun --nproc_per_node=8 --nnodes=4 --node_rank=0 \
+  --master_addr=10.0.0.1 --master_port=29500 \
+  train.py config/train_gpt2.py \
+  --gradient_accumulation_steps=64 \
+  --compile=False \
+  --dtype=float32 \
+  --disable_flash=True
+
+# Node 1
+torchrun --nproc_per_node=8 --nnodes=4 --node_rank=1 \
+  --master_addr=10.0.0.1 --master_port=29500 \
+  train.py config/train_gpt2.py \
+  --gradient_accumulation_steps=64 \
+  --compile=False \
+  --dtype=float32 \
+  --disable_flash=True
+
+# Node 2  (--node_rank=2)
+# Node 3  (--node_rank=3)
+```
+
+`gradient_accumulation_steps` must be divisible by **total GPU count** (32). The default `40` from `config/train_gpt2.py` is not divisible by 32; use `64` or `128` instead.
+
+If you do not have InfiniBand:
+
+```sh
+export NCCL_IB_DISABLE=1
+export NCCL_SOCKET_IFNAME=eth0   # adjust to your network interface
+```
+
+### 4. Reading training logs
+
+| Log field | Meaning |
+| --------- | ------- |
+| `tokens per iteration` | Total tokens processed per optimizer step (all GPUs combined) |
+| `time XXms` | Wall-clock time for one optimizer step on the master rank |
+| `mfu XX%` | Model FLOPs Utilization — **single-GPU** estimate vs A100 peak; not aggregated across GPUs |
+
+Multi-GPU speedup shows up in **tokens/second**, not necessarily in per-iteration wall time (each iteration already processes more tokens).
+
+### 5. Sample from a trained checkpoint
+
+```sh
+python sample.py --out_dir=out-shakespeare-char --device=auto
+```
+
+## Experiment results
+
+Experiments below were run on the character-level Shakespeare dataset (`config/train_shakespeare_char.py`, 10.65M params, `max_iters=5000`) with `--compile=False --dtype=float32 --disable_flash=True`.
+
+### Single GPU — 1× NVIDIA H20
+
+```sh
+python train.py config/train_shakespeare_char.py \
+  --compile=False --dtype=float32 --disable_flash=True
+```
+
+| Metric | Value |
+| ------ | ----- |
+| Tokens / iteration | 16,384 |
+| Time / iteration | ~36 ms |
+| MFU (rank 0) | ~10% |
+| Step 5000 train loss | 0.6282 |
+| Step 5000 val loss | 1.6920 |
+
+### Multi-GPU — 8× NVIDIA H20 (single node, DDP)
+
+```sh
+torchrun --standalone --nproc_per_node=8 train.py config/train_shakespeare_char.py \
+  --gradient_accumulation_steps=8 \
+  --compile=False --dtype=float32 --disable_flash=True
+```
+
+| Metric | Value |
+| ------ | ----- |
+| Tokens / iteration | 131,072 (8× single GPU) |
+| Time / iteration | ~37 ms |
+| MFU (rank 0) | ~9% |
+| Step 5000 train loss | 0.0861 |
+| Step 5000 val loss | 3.1265 |
+
+**Notes:**
+
+- DDP was confirmed working (`tokens per iteration will be: 131,072`; all 8 GPUs active in `nvidia-smi`).
+- Per-iteration wall time stayed ~37 ms because each GPU still runs one forward/backward pass per step; throughput in tokens/s is ~8× higher, not 8× faster per iteration.
+- Val loss was much worse than single-GPU despite lower train loss: with the same `max_iters=5000`, the 8-GPU run saw ~8× more total tokens (~655M vs ~82M), causing severe overfitting on this tiny dataset (train memorized, val degraded).
+- For a fair token-matched comparison on 8 GPUs, use `--max_iters=625` with `--gradient_accumulation_steps=8`.
+
+### Apple Silicon — MacBook M4 Max (single GPU, MPS)
+
+```sh
+python train.py config/train_shakespeare_char.py --device=mps --compile=False
+```
+
+Training ran successfully on MPS. Same config (`max_iters=5000`); useful as a local debug path before moving to cluster GPUs.
+
+### Issues encountered on H20
+
+| Symptom | Cause | Fix |
+| ------- | ----- | --- |
+| `Floating point exception (core dumped)` after step 0 eval | `bfloat16` / Flash Attention backward on H20 | `--dtype=float32 --disable_flash=True` |
+| `AssertionError` on `gradient_accumulation_steps` | Value not divisible by GPU count | e.g. `--gradient_accumulation_steps=8` for 8 GPUs |
+| No speedup in per-iter `time` with 8 GPUs | Expected — DDP adds throughput, not faster single-batch steps | Compare tokens/s, not iter time |
+
 ## reproducing GPT-2
 
 A more serious deep learning professional may be more interested in reproducing GPT-2 results. So here we go - we first tokenize the dataset, in this case the [OpenWebText](https://openwebtext2.readthedocs.io/en/latest/), an open reproduction of OpenAI's (private) WebText:
