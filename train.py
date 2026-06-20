@@ -55,6 +55,7 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+disable_flash = False # set True if SDPA backward SIGFPE on your GPU (some H20 / bf16 stacks)
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -73,6 +74,7 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'auto' # 'auto', 'mps' (Apple Silicon GPU), 'cpu', 'cuda', 'cuda:0', etc.
 dtype = 'auto' # 'auto', 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
+fused_adamw = True # fused AdamW is faster but can be unstable with bf16 on some GPUs
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -151,7 +153,7 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, disable_flash=disable_flash) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -199,10 +201,15 @@ if block_size < model.config.block_size:
 model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+use_fp16_scaler = dtype == 'float16'
+if device_type == 'cuda':
+    scaler = torch.amp.GradScaler('cuda', enabled=use_fp16_scaler)
+else:
+    scaler = torch.amp.GradScaler('cpu', enabled=False)
 
-# optimizer
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+# optimizer (disable fused AdamW under bf16; it can SIGFPE on some H20 stacks)
+use_fused_adamw = fused_adamw and dtype == 'float16'
+optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type, fused_adamw=use_fused_adamw)
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None # free up memory
@@ -311,7 +318,8 @@ while True:
         scaler.scale(loss).backward()
     # clip the gradient
     if grad_clip != 0.0:
-        scaler.unscale_(optimizer)
+        if use_fp16_scaler:
+            scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     # step the optimizer and scaler if training in fp16
     scaler.step(optimizer)
